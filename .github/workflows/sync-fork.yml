@@ -1,0 +1,150 @@
+name: Sync All Forks
+on:
+  schedule:
+    - cron: '0 2 * * *'    # mỗi ngày lúc 2h UTC (9h sáng VN)
+  workflow_dispatch:         # hoặc bấm tay
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60      # tối đa 60 phút cho toàn bộ job
+    steps:
+      - name: Sync all forked repos
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          OWNER: dongphuongman
+        run: |
+          set -uo pipefail
+
+          # ============================================
+          # CẤU HÌNH
+          # ============================================
+          # Repo nào KHÔNG muốn sync thì thêm vào đây (cách nhau bằng space)
+          EXCLUDE=""
+
+          # Counters
+          TOTAL=0
+          SUCCESS=0
+          FAILED=0
+          SKIPPED=0
+
+          # ============================================
+          # LẤY TOÀN BỘ FORK (có pagination)
+          # ============================================
+          echo "📋 Fetching all forked repos for $OWNER..."
+
+          ALL_FORKS=""
+          PAGE=1
+          PER_PAGE=100
+
+          while true; do
+            echo "  Fetching page $PAGE..."
+            PAGE_DATA=$(gh api "/users/$OWNER/repos?per_page=$PER_PAGE&page=$PAGE&type=forks" \
+              --jq '.[] | [.name, .parent.full_name, .default_branch] | @tsv' 2>&1) || true
+
+            # Nếu page trống thì dừng
+            if [ -z "$PAGE_DATA" ]; then
+              echo "  Page $PAGE empty, done fetching."
+              break
+            fi
+
+            # Đếm số repo trong page
+            COUNT=$(echo "$PAGE_DATA" | wc -l)
+            echo "  Found $COUNT repos on page $PAGE"
+
+            # Gộp vào danh sách tổng
+            if [ -z "$ALL_FORKS" ]; then
+              ALL_FORKS="$PAGE_DATA"
+            else
+              ALL_FORKS="$ALL_FORKS"$'\n'"$PAGE_DATA"
+            fi
+
+            # Nếu page không đủ PER_PAGE thì đây là page cuối
+            if [ "$COUNT" -lt "$PER_PAGE" ]; then
+              echo "  Last page reached."
+              break
+            fi
+
+            PAGE=$((PAGE + 1))
+
+            # Safety: tối đa 20 page = 2000 repos
+            if [ "$PAGE" -gt 20 ]; then
+              echo "⚠️  Hit 20 page limit (2000 repos), stopping fetch."
+              break
+            fi
+          done
+
+          TOTAL=$(echo "$ALL_FORKS" | grep -c . || true)
+          echo ""
+          echo "📊 Total forked repos found: $TOTAL"
+          echo "========================================="
+
+          # ============================================
+          # SYNC TỪNG REPO
+          # ============================================
+          CURRENT=0
+
+          echo "$ALL_FORKS" | while IFS=$'\t' read -r REPO_NAME PARENT_FULL DEFAULT_BRANCH; do
+            [ -z "$REPO_NAME" ] && continue
+            CURRENT=$((CURRENT + 1))
+
+            echo ""
+            echo "[$CURRENT/$TOTAL] 🔄 $REPO_NAME"
+            echo "  upstream: $PARENT_FULL (branch: $DEFAULT_BRANCH)"
+            echo "-----------------------------------------"
+
+            # Skip excluded repos
+            if [ -n "$EXCLUDE" ] && echo "$EXCLUDE" | grep -qw "$REPO_NAME" 2>/dev/null; then
+              echo "  ⏭️  Skipping (in exclude list)"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            WORKDIR="/tmp/sync-$REPO_NAME"
+            rm -rf "$WORKDIR"
+
+            # Clone fork
+            if ! git clone --depth 1 \
+              "https://x-access-token:${GH_TOKEN}@github.com/$OWNER/$REPO_NAME.git" \
+              "$WORKDIR" 2>&1; then
+              echo "  ❌ Clone failed, skipping"
+              FAILED=$((FAILED + 1))
+              continue
+            fi
+
+            # Sync trong subshell
+            (
+              cd "$WORKDIR"
+              git config user.name "auto-sync-bot"
+              git config user.email "bot@users.noreply.github.com"
+
+              git remote add upstream "https://github.com/$PARENT_FULL.git"
+              git fetch upstream "$DEFAULT_BRANCH" --depth 1
+
+              git reset --hard "upstream/$DEFAULT_BRANCH"
+              git push origin "$DEFAULT_BRANCH" --force
+            ) 2>&1
+
+            if [ $? -eq 0 ]; then
+              echo "  ✅ Synced!"
+              SUCCESS=$((SUCCESS + 1))
+            else
+              echo "  ❌ Failed!"
+              FAILED=$((FAILED + 1))
+            fi
+
+            rm -rf "$WORKDIR"
+          done
+
+          # ============================================
+          # KẾT QUẢ
+          # ============================================
+          echo ""
+          echo "========================================="
+          echo "🏁 SYNC COMPLETE"
+          echo "========================================="
+          echo "  Total:   $TOTAL"
+          echo "  ✅ OK:    $SUCCESS"
+          echo "  ❌ Fail:  $FAILED"
+          echo "  ⏭️  Skip:  $SKIPPED"
+          echo "========================================="
