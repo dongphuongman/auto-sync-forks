@@ -1,89 +1,133 @@
 name: Sync All Forks
 on:
   schedule:
-    - cron: '0 2 * * *'    # mỗi ngày lúc 2h UTC (9h sáng VN)
-  workflow_dispatch:         # hoặc bấm tay
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60      # tối đa 60 phút cho toàn bộ job
+    timeout-minutes: 60
     steps:
       - name: Sync all forked repos
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           OWNER: dongphuongman
         run: |
-          set -uo pipefail
+          set +e
 
-          # ============================================
-          # CẤU HÌNH
-          # ============================================
-          # Repo nào KHÔNG muốn sync thì thêm vào đây (cách nhau bằng space)
           EXCLUDE=""
+          TOTAL=0; SUCCESS=0; FAILED=0; SKIPPED=0
 
-          # Counters
-          TOTAL=0
-          SUCCESS=0
-          FAILED=0
-          SKIPPED=0
-
-          # ============================================
-          # LẤY TOÀN BỘ FORK (có pagination)
-          # ============================================
           echo "📋 Fetching all forked repos for $OWNER..."
 
           ALL_FORKS=""
-          PAGE=1
-          PER_PAGE=100
+          HAS_NEXT="true"
+          CURSOR=""
+          PAGE_NUM=0
+          BATCH_SIZE=30
+          MAX_RETRIES=3
+          GQL_FAILED="false"
 
-          while true; do
-            echo "  Fetching page $PAGE..."
-            PAGE_DATA=$(gh api "/users/$OWNER/repos?per_page=$PER_PAGE&page=$PAGE&type=forks" \
-              --jq '.[] | [.name, .parent.full_name, .default_branch] | @tsv' 2>&1) || true
+          while [ "$HAS_NEXT" = "true" ] && [ "$GQL_FAILED" = "false" ]; do
+            PAGE_NUM=$((PAGE_NUM + 1))
 
-            # Nếu page trống thì dừng
-            if [ -z "$PAGE_DATA" ]; then
-              echo "  Page $PAGE empty, done fetching."
-              break
-            fi
-
-            # Đếm số repo trong page
-            COUNT=$(echo "$PAGE_DATA" | wc -l)
-            echo "  Found $COUNT repos on page $PAGE"
-
-            # Gộp vào danh sách tổng
-            if [ -z "$ALL_FORKS" ]; then
-              ALL_FORKS="$PAGE_DATA"
+            if [ -z "$CURSOR" ]; then
+              AFTER_ARG=""
             else
-              ALL_FORKS="$ALL_FORKS"$'\n'"$PAGE_DATA"
+              AFTER_ARG=", after: \"$CURSOR\""
             fi
 
-            # Nếu page không đủ PER_PAGE thì đây là page cuối
-            if [ "$COUNT" -lt "$PER_PAGE" ]; then
-              echo "  Last page reached."
+            echo "  Fetching page $PAGE_NUM (GraphQL)..."
+
+            GQL_QUERY="{ user(login: \"$OWNER\") { repositories(first: $BATCH_SIZE, isFork: true${AFTER_ARG}) { pageInfo { hasNextPage endCursor } nodes { name defaultBranchRef { name } parent { nameWithOwner defaultBranchRef { name } } } } } }"
+
+            RESPONSE=""
+            for ATTEMPT in $(seq 1 $MAX_RETRIES); do
+              RESPONSE=$(gh api graphql -f query="$GQL_QUERY" 2>&1) && break
+              echo "    Attempt $ATTEMPT failed, waiting ${ATTEMPT}0s..."
+              sleep $((ATTEMPT * 10))
+            done
+
+            if echo "$RESPONSE" | grep -qi "bad gateway\|502\|500\|error"; then
+              echo "  ❌ GraphQL failed after $MAX_RETRIES retries"
+              GQL_FAILED="true"
               break
             fi
 
-            PAGE=$((PAGE + 1))
+            PAGE_DATA=$(echo "$RESPONSE" | jq -r '
+              .data.user.repositories.nodes[] |
+              select(.parent != null) |
+              [
+                .name,
+                .parent.nameWithOwner,
+                (.parent.defaultBranchRef.name // .defaultBranchRef.name // "main")
+              ] | @tsv
+            ' 2>/dev/null) || true
 
-            # Safety: tối đa 20 page = 2000 repos
-            if [ "$PAGE" -gt 20 ]; then
-              echo "⚠️  Hit 20 page limit (2000 repos), stopping fetch."
+            if [ -n "$PAGE_DATA" ]; then
+              COUNT=$(echo "$PAGE_DATA" | wc -l)
+              echo "  Got $COUNT repos"
+              if [ -z "$ALL_FORKS" ]; then
+                ALL_FORKS="$PAGE_DATA"
+              else
+                ALL_FORKS="$ALL_FORKS"$'\n'"$PAGE_DATA"
+              fi
+            fi
+
+            HAS_NEXT=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.hasNextPage // "false"' 2>/dev/null) || break
+            CURSOR=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.endCursor // empty' 2>/dev/null) || break
+
+            sleep 1
+
+            if [ "$PAGE_NUM" -ge 30 ]; then
+              echo "⚠️ Safety limit reached"
               break
             fi
           done
+
+          # Nếu GraphQL fail -> reset và dùng REST API từ đầu
+          if [ "$GQL_FAILED" = "true" ]; then
+            echo "  🔄 Falling back to REST API (resetting data)..."
+            ALL_FORKS=""
+            REST_PAGE=1
+            while true; do
+              REST_DATA=$(gh api "/users/$OWNER/repos?per_page=100&page=$REST_PAGE&type=forks" \
+                --jq '.[].full_name' 2>/dev/null) || break
+              [ -z "$REST_DATA" ] && break
+
+              while IFS= read -r FORK_FULL; do
+                REPO_NAME=$(basename "$FORK_FULL")
+                PARENT_INFO=$(gh api "/repos/$FORK_FULL" \
+                  --jq '[.parent.full_name, .parent.default_branch] | @tsv' 2>/dev/null) || continue
+                [ -z "$PARENT_INFO" ] && continue
+
+                LINE="${REPO_NAME}	${PARENT_INFO}"
+                if [ -z "$ALL_FORKS" ]; then
+                  ALL_FORKS="$LINE"
+                else
+                  ALL_FORKS="$ALL_FORKS"$'\n'"$LINE"
+                fi
+              done <<< "$REST_DATA"
+
+              RCOUNT=$(echo "$REST_DATA" | wc -l)
+              echo "    REST page $REST_PAGE: $RCOUNT repos"
+              [ "$RCOUNT" -lt 100 ] && break
+              REST_PAGE=$((REST_PAGE + 1))
+            done
+          fi
 
           TOTAL=$(echo "$ALL_FORKS" | grep -c . || true)
           echo ""
           echo "📊 Total forked repos found: $TOTAL"
           echo "========================================="
 
-          # ============================================
-          # SYNC TỪNG REPO
-          # ============================================
-          CURRENT=0
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "No forks found. Exiting."
+            exit 0
+          fi
 
+          CURRENT=0
           echo "$ALL_FORKS" | while IFS=$'\t' read -r REPO_NAME PARENT_FULL DEFAULT_BRANCH; do
             [ -z "$REPO_NAME" ] && continue
             CURRENT=$((CURRENT + 1))
@@ -93,9 +137,8 @@ jobs:
             echo "  upstream: $PARENT_FULL (branch: $DEFAULT_BRANCH)"
             echo "-----------------------------------------"
 
-            # Skip excluded repos
             if [ -n "$EXCLUDE" ] && echo "$EXCLUDE" | grep -qw "$REPO_NAME" 2>/dev/null; then
-              echo "  ⏭️  Skipping (in exclude list)"
+              echo "  ⏭️  Skipping"
               SKIPPED=$((SKIPPED + 1))
               continue
             fi
@@ -103,26 +146,26 @@ jobs:
             WORKDIR="/tmp/sync-$REPO_NAME"
             rm -rf "$WORKDIR"
 
-            # Clone fork
             if ! git clone --depth 1 \
               "https://x-access-token:${GH_TOKEN}@github.com/$OWNER/$REPO_NAME.git" \
               "$WORKDIR" 2>&1; then
-              echo "  ❌ Clone failed, skipping"
+              echo "  ❌ Clone failed"
               FAILED=$((FAILED + 1))
               continue
             fi
 
-            # Sync trong subshell
             (
               cd "$WORKDIR"
               git config user.name "auto-sync-bot"
               git config user.email "bot@users.noreply.github.com"
-
               git remote add upstream "https://github.com/$PARENT_FULL.git"
               git fetch upstream "$DEFAULT_BRANCH" --depth 1
-
               git reset --hard "upstream/$DEFAULT_BRANCH"
-              git push origin "$DEFAULT_BRANCH" --force
+              git push origin "$DEFAULT_BRANCH" --force 2>&1 || {
+                echo "    Retrying push without workflow files..."
+                git diff --name-only "origin/$DEFAULT_BRANCH" -- .github/workflows/ | xargs -r git checkout "origin/$DEFAULT_BRANCH" -- 2>/dev/null || true
+                git push origin "$DEFAULT_BRANCH" --force
+              }
             ) 2>&1
 
             if [ $? -eq 0 ]; then
@@ -136,9 +179,6 @@ jobs:
             rm -rf "$WORKDIR"
           done
 
-          # ============================================
-          # KẾT QUẢ
-          # ============================================
           echo ""
           echo "========================================="
           echo "🏁 SYNC COMPLETE"
