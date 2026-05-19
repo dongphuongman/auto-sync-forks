@@ -25,6 +25,8 @@ jobs:
           HAS_NEXT="true"
           CURSOR=""
           PAGE_NUM=0
+          BATCH_SIZE=30
+          MAX_RETRIES=3
 
           while [ "$HAS_NEXT" = "true" ]; do
             PAGE_NUM=$((PAGE_NUM + 1))
@@ -37,23 +39,54 @@ jobs:
 
             echo "  Fetching page $PAGE_NUM..."
 
-            # Build query as a variable to avoid YAML quoting issues
-            GQL_QUERY="{ user(login: \"$OWNER\") { repositories(first: 100, isFork: true${AFTER_ARG}) { pageInfo { hasNextPage endCursor } nodes { name defaultBranchRef { name } parent { nameWithOwner defaultBranchRef { name } } } } } }"
+            GQL_QUERY="{ user(login: \"$OWNER\") { repositories(first: $BATCH_SIZE, isFork: true${AFTER_ARG}) { pageInfo { hasNextPage endCursor } nodes { name defaultBranchRef { name } parent { nameWithOwner defaultBranchRef { name } } } } } }"
 
-            echo "  Running GraphQL query..."
-            RESPONSE=$(gh api graphql -f query="$GQL_QUERY" 2>&1) || {
-              echo "  ❌ gh api call failed:"
-              echo "  $RESPONSE"
-              break
-            }
+            # Retry loop
+            RESPONSE=""
+            for ATTEMPT in $(seq 1 $MAX_RETRIES); do
+              RESPONSE=$(gh api graphql -f query="$GQL_QUERY" 2>&1) && break
+              echo "    Attempt $ATTEMPT failed, waiting ${ATTEMPT}0s..."
+              sleep $((ATTEMPT * 10))
+            done
 
-            # Check for errors
-            ERRORS=$(echo "$RESPONSE" | jq -r '.errors[0].message // empty' 2>/dev/null)
-            if [ -n "$ERRORS" ]; then
-              echo "  ❌ GraphQL error: $ERRORS"
+            # Check if still failing
+            if echo "$RESPONSE" | grep -qi "bad gateway\|502\|500\|error"; then
+              ERRORS=$(echo "$RESPONSE" | head -3)
+              echo "  ❌ API error after $MAX_RETRIES retries: $ERRORS"
+              echo "  Trying REST API fallback..."
+
+              # === FALLBACK: REST API (1 call per repo) ===
+              echo "  Falling back to REST API..."
+              REST_PAGE=1
+              while true; do
+                REST_DATA=$(gh api "/users/$OWNER/repos?per_page=100&page=$REST_PAGE&type=forks" \
+                  --jq '.[].full_name' 2>/dev/null) || break
+                [ -z "$REST_DATA" ] && break
+
+                while IFS= read -r FORK_FULL; do
+                  REPO_NAME=$(basename "$FORK_FULL")
+                  # Get parent info per repo
+                  PARENT_INFO=$(gh api "/repos/$FORK_FULL" \
+                    --jq '[.parent.full_name, .parent.default_branch] | @tsv' 2>/dev/null) || continue
+                  [ -z "$PARENT_INFO" ] && continue
+
+                  LINE="${REPO_NAME}	${PARENT_INFO}"
+                  if [ -z "$ALL_FORKS" ]; then
+                    ALL_FORKS="$LINE"
+                  else
+                    ALL_FORKS="$ALL_FORKS"$'\n'"$LINE"
+                  fi
+                done <<< "$REST_DATA"
+
+                RCOUNT=$(echo "$REST_DATA" | wc -l)
+                echo "    REST page $REST_PAGE: $RCOUNT repos"
+                [ "$RCOUNT" -lt 100 ] && break
+                REST_PAGE=$((REST_PAGE + 1))
+              done
               break
             fi
 
+            # Parse GraphQL response
             PAGE_DATA=$(echo "$RESPONSE" | jq -r '
               .data.user.repositories.nodes[] |
               select(.parent != null) |
@@ -72,15 +105,16 @@ jobs:
               else
                 ALL_FORKS="$ALL_FORKS"$'\n'"$PAGE_DATA"
               fi
-            else
-              echo "  No repos on this page"
             fi
 
             HAS_NEXT=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.hasNextPage // "false"' 2>/dev/null) || break
             CURSOR=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.endCursor // empty' 2>/dev/null) || break
 
-            if [ "$PAGE_NUM" -ge 20 ]; then
-              echo "⚠️ Safety limit: 20 pages"
+            # Rate limit friendly
+            sleep 1
+
+            if [ "$PAGE_NUM" -ge 30 ]; then
+              echo "⚠️ Safety limit reached"
               break
             fi
           done
