@@ -7,7 +7,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 60      # tối đa 60 phút cho toàn bộ job
     steps:
       - name: Sync all forked repos
         env:
@@ -19,80 +19,59 @@ jobs:
           # ============================================
           # CẤU HÌNH
           # ============================================
+          # Repo nào KHÔNG muốn sync thì thêm vào đây (cách nhau bằng space)
           EXCLUDE=""
 
+          # Counters
           TOTAL=0
           SUCCESS=0
           FAILED=0
           SKIPPED=0
 
           # ============================================
-          # LẤY TOÀN BỘ FORK BẰNG GraphQL (có parent info)
+          # LẤY TOÀN BỘ FORK (có pagination)
           # ============================================
           echo "📋 Fetching all forked repos for $OWNER..."
 
           ALL_FORKS=""
-          HAS_NEXT="true"
-          CURSOR=""
+          PAGE=1
+          PER_PAGE=100
 
-          while [ "$HAS_NEXT" = "true" ]; do
-            if [ -z "$CURSOR" ]; then
-              AFTER_CLAUSE="null"
+          while true; do
+            echo "  Fetching page $PAGE..."
+            PAGE_DATA=$(gh api "/users/$OWNER/repos?per_page=$PER_PAGE&page=$PAGE&type=forks" \
+              --jq '.[] | select(.parent != null) | [.name, .parent.full_name, .default_branch] | @tsv' 2>&1) || true
+
+            # Nếu page trống thì dừng
+            if [ -z "$PAGE_DATA" ]; then
+              echo "  Page $PAGE empty, done fetching."
+              break
+            fi
+
+            # Đếm số repo trong page
+            COUNT=$(echo "$PAGE_DATA" | wc -l)
+            echo "  Found $COUNT repos on page $PAGE"
+
+            # Gộp vào danh sách tổng
+            if [ -z "$ALL_FORKS" ]; then
+              ALL_FORKS="$PAGE_DATA"
             else
-              AFTER_CLAUSE="\"$CURSOR\""
+              ALL_FORKS="$ALL_FORKS"$'\n'"$PAGE_DATA"
             fi
 
-            QUERY='query {
-              user(login: "'"$OWNER"'") {
-                repositories(first: 100, isFork: true, after: '"$AFTER_CLAUSE"') {
-                  pageInfo {
-                    hasNextPage
-                    endCursor
-                  }
-                  nodes {
-                    name
-                    defaultBranchRef {
-                      name
-                    }
-                    parent {
-                      nameWithOwner
-                      defaultBranchRef {
-                        name
-                      }
-                    }
-                  }
-                }
-              }
-            }'
-
-            RESPONSE=$(gh api graphql -f query="$QUERY" 2>&1)
-
-            # Parse từng repo
-            PAGE_DATA=$(echo "$RESPONSE" | jq -r '
-              .data.user.repositories.nodes[] |
-              select(.parent != null) |
-              [
-                .name,
-                .parent.nameWithOwner,
-                (.parent.defaultBranchRef.name // .defaultBranchRef.name // "main")
-              ] | @tsv
-            ' 2>/dev/null) || true
-
-            if [ -n "$PAGE_DATA" ]; then
-              COUNT=$(echo "$PAGE_DATA" | wc -l)
-              echo "  Fetched $COUNT repos..."
-
-              if [ -z "$ALL_FORKS" ]; then
-                ALL_FORKS="$PAGE_DATA"
-              else
-                ALL_FORKS="$ALL_FORKS"$'\n'"$PAGE_DATA"
-              fi
+            # Nếu page không đủ PER_PAGE thì đây là page cuối
+            if [ "$COUNT" -lt "$PER_PAGE" ]; then
+              echo "  Last page reached."
+              break
             fi
 
-            # Check next page
-            HAS_NEXT=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.hasNextPage' 2>/dev/null) || break
-            CURSOR=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.endCursor' 2>/dev/null) || break
+            PAGE=$((PAGE + 1))
 
+            # Safety: tối đa 20 page = 2000 repos
+            if [ "$PAGE" -gt 20 ]; then
+              echo "⚠️  Hit 20 page limit (2000 repos), stopping fetch."
+              break
+            fi
           done
 
           TOTAL=$(echo "$ALL_FORKS" | grep -c . || true)
@@ -107,6 +86,15 @@ jobs:
 
           echo "$ALL_FORKS" | while IFS=$'\t' read -r REPO_NAME PARENT_FULL DEFAULT_BRANCH; do
             [ -z "$REPO_NAME" ] && continue
+            
+            # Validate that PARENT_FULL is valid (contains "/" and is not just a branch name)
+            if [ -z "$PARENT_FULL" ] || ! echo "$PARENT_FULL" | grep -q '/'; then
+              echo ""
+              echo "⚠️  Skipping $REPO_NAME (invalid parent repository info)"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+            
             CURRENT=$((CURRENT + 1))
 
             echo ""
