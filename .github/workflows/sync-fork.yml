@@ -20,35 +20,50 @@ jobs:
           TOTAL=0; SUCCESS=0; FAILED=0; SKIPPED=0
 
           echo "📋 Fetching all forked repos for $OWNER..."
+          echo "🔑 Testing token..."
+          gh auth status || echo "⚠️ Token auth check failed"
 
           ALL_FORKS=""
           HAS_NEXT="true"
           CURSOR=""
+          PAGE_NUM=0
 
           while [ "$HAS_NEXT" = "true" ]; do
+            PAGE_NUM=$((PAGE_NUM + 1))
+
             if [ -z "$CURSOR" ]; then
               AFTER_CLAUSE="null"
             else
               AFTER_CLAUSE="\"$CURSOR\""
             fi
 
-            QUERY='query {
-              user(login: "'"$OWNER"'") {
-                repositories(first: 100, isFork: true, after: '"$AFTER_CLAUSE"') {
-                  pageInfo { hasNextPage endCursor }
-                  nodes {
-                    name
-                    defaultBranchRef { name }
-                    parent {
-                      nameWithOwner
+            echo "  Fetching page $PAGE_NUM (cursor: $AFTER_CLAUSE)..."
+
+            RESPONSE=$(gh api graphql -f query='
+              query {
+                user(login: "'"$OWNER"'") {
+                  repositories(first: 100, isFork: true, after: '"$AFTER_CLAUSE"') {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      name
                       defaultBranchRef { name }
+                      parent {
+                        nameWithOwner
+                        defaultBranchRef { name }
+                      }
                     }
                   }
                 }
               }
-            }'
+            ' 2>&1)
 
-            RESPONSE=$(gh api graphql -f query="$QUERY" 2>&1)
+            # Debug: show nếu có lỗi
+            ERRORS=$(echo "$RESPONSE" | jq -r '.errors[0].message // empty' 2>/dev/null)
+            if [ -n "$ERRORS" ]; then
+              echo "  ❌ GraphQL error: $ERRORS"
+              echo "  Full response: $RESPONSE"
+              break
+            fi
 
             PAGE_DATA=$(echo "$RESPONSE" | jq -r '
               .data.user.repositories.nodes[] |
@@ -62,22 +77,35 @@ jobs:
 
             if [ -n "$PAGE_DATA" ]; then
               COUNT=$(echo "$PAGE_DATA" | wc -l)
-              echo "  Fetched $COUNT repos..."
+              echo "  Got $COUNT repos"
               if [ -z "$ALL_FORKS" ]; then
                 ALL_FORKS="$PAGE_DATA"
               else
                 ALL_FORKS="$ALL_FORKS"$'\n'"$PAGE_DATA"
               fi
+            else
+              echo "  No repos on this page"
             fi
 
-            HAS_NEXT=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.hasNextPage' 2>/dev/null) || break
-            CURSOR=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.endCursor' 2>/dev/null) || break
+            HAS_NEXT=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.hasNextPage // "false"' 2>/dev/null) || break
+            CURSOR=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.endCursor // empty' 2>/dev/null) || break
+
+            if [ "$PAGE_NUM" -ge 20 ]; then
+              echo "⚠️ Safety limit: 20 pages"
+              break
+            fi
           done
 
           TOTAL=$(echo "$ALL_FORKS" | grep -c . || true)
           echo ""
           echo "📊 Total forked repos found: $TOTAL"
           echo "========================================="
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "No forks found. Check token permissions."
+            echo "Token needs: repo scope (or fine-grained: Contents R/W + Metadata R)"
+            exit 0
+          fi
 
           CURRENT=0
           echo "$ALL_FORKS" | while IFS=$'\t' read -r REPO_NAME PARENT_FULL DEFAULT_BRANCH; do
