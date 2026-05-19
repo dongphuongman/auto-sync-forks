@@ -14,7 +14,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           OWNER: dongphuongman
         run: |
-          set -uo pipefail
+          set +e
 
           EXCLUDE=""
           TOTAL=0; SUCCESS=0; FAILED=0; SKIPPED=0
@@ -27,8 +27,9 @@ jobs:
           PAGE_NUM=0
           BATCH_SIZE=30
           MAX_RETRIES=3
+          GQL_FAILED="false"
 
-          while [ "$HAS_NEXT" = "true" ]; do
+          while [ "$HAS_NEXT" = "true" ] && [ "$GQL_FAILED" = "false" ]; do
             PAGE_NUM=$((PAGE_NUM + 1))
 
             if [ -z "$CURSOR" ]; then
@@ -37,11 +38,10 @@ jobs:
               AFTER_ARG=", after: \"$CURSOR\""
             fi
 
-            echo "  Fetching page $PAGE_NUM..."
+            echo "  Fetching page $PAGE_NUM (GraphQL)..."
 
             GQL_QUERY="{ user(login: \"$OWNER\") { repositories(first: $BATCH_SIZE, isFork: true${AFTER_ARG}) { pageInfo { hasNextPage endCursor } nodes { name defaultBranchRef { name } parent { nameWithOwner defaultBranchRef { name } } } } } }"
 
-            # Retry loop
             RESPONSE=""
             for ATTEMPT in $(seq 1 $MAX_RETRIES); do
               RESPONSE=$(gh api graphql -f query="$GQL_QUERY" 2>&1) && break
@@ -49,44 +49,12 @@ jobs:
               sleep $((ATTEMPT * 10))
             done
 
-            # Check if still failing
             if echo "$RESPONSE" | grep -qi "bad gateway\|502\|500\|error"; then
-              ERRORS=$(echo "$RESPONSE" | head -3)
-              echo "  ❌ API error after $MAX_RETRIES retries: $ERRORS"
-              echo "  Trying REST API fallback..."
-
-              # === FALLBACK: REST API (1 call per repo) ===
-              echo "  Falling back to REST API..."
-              REST_PAGE=1
-              while true; do
-                REST_DATA=$(gh api "/users/$OWNER/repos?per_page=100&page=$REST_PAGE&type=forks" \
-                  --jq '.[].full_name' 2>/dev/null) || break
-                [ -z "$REST_DATA" ] && break
-
-                while IFS= read -r FORK_FULL; do
-                  REPO_NAME=$(basename "$FORK_FULL")
-                  # Get parent info per repo
-                  PARENT_INFO=$(gh api "/repos/$FORK_FULL" \
-                    --jq '[.parent.full_name, .parent.default_branch] | @tsv' 2>/dev/null) || continue
-                  [ -z "$PARENT_INFO" ] && continue
-
-                  LINE="${REPO_NAME}	${PARENT_INFO}"
-                  if [ -z "$ALL_FORKS" ]; then
-                    ALL_FORKS="$LINE"
-                  else
-                    ALL_FORKS="$ALL_FORKS"$'\n'"$LINE"
-                  fi
-                done <<< "$REST_DATA"
-
-                RCOUNT=$(echo "$REST_DATA" | wc -l)
-                echo "    REST page $REST_PAGE: $RCOUNT repos"
-                [ "$RCOUNT" -lt 100 ] && break
-                REST_PAGE=$((REST_PAGE + 1))
-              done
+              echo "  ❌ GraphQL failed after $MAX_RETRIES retries"
+              GQL_FAILED="true"
               break
             fi
 
-            # Parse GraphQL response
             PAGE_DATA=$(echo "$RESPONSE" | jq -r '
               .data.user.repositories.nodes[] |
               select(.parent != null) |
@@ -110,7 +78,6 @@ jobs:
             HAS_NEXT=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.hasNextPage // "false"' 2>/dev/null) || break
             CURSOR=$(echo "$RESPONSE" | jq -r '.data.user.repositories.pageInfo.endCursor // empty' 2>/dev/null) || break
 
-            # Rate limit friendly
             sleep 1
 
             if [ "$PAGE_NUM" -ge 30 ]; then
@@ -118,6 +85,37 @@ jobs:
               break
             fi
           done
+
+          # Nếu GraphQL fail -> reset và dùng REST API từ đầu
+          if [ "$GQL_FAILED" = "true" ]; then
+            echo "  🔄 Falling back to REST API (resetting data)..."
+            ALL_FORKS=""
+            REST_PAGE=1
+            while true; do
+              REST_DATA=$(gh api "/users/$OWNER/repos?per_page=100&page=$REST_PAGE&type=forks" \
+                --jq '.[].full_name' 2>/dev/null) || break
+              [ -z "$REST_DATA" ] && break
+
+              while IFS= read -r FORK_FULL; do
+                REPO_NAME=$(basename "$FORK_FULL")
+                PARENT_INFO=$(gh api "/repos/$FORK_FULL" \
+                  --jq '[.parent.full_name, .parent.default_branch] | @tsv' 2>/dev/null) || continue
+                [ -z "$PARENT_INFO" ] && continue
+
+                LINE="${REPO_NAME}	${PARENT_INFO}"
+                if [ -z "$ALL_FORKS" ]; then
+                  ALL_FORKS="$LINE"
+                else
+                  ALL_FORKS="$ALL_FORKS"$'\n'"$LINE"
+                fi
+              done <<< "$REST_DATA"
+
+              RCOUNT=$(echo "$REST_DATA" | wc -l)
+              echo "    REST page $REST_PAGE: $RCOUNT repos"
+              [ "$RCOUNT" -lt 100 ] && break
+              REST_PAGE=$((REST_PAGE + 1))
+            done
+          fi
 
           TOTAL=$(echo "$ALL_FORKS" | grep -c . || true)
           echo ""
@@ -163,7 +161,11 @@ jobs:
               git remote add upstream "https://github.com/$PARENT_FULL.git"
               git fetch upstream "$DEFAULT_BRANCH" --depth 1
               git reset --hard "upstream/$DEFAULT_BRANCH"
-              git push origin "$DEFAULT_BRANCH" --force
+              git push origin "$DEFAULT_BRANCH" --force 2>&1 || {
+                echo "    Retrying push without workflow files..."
+                git diff --name-only "origin/$DEFAULT_BRANCH" -- .github/workflows/ | xargs -r git checkout "origin/$DEFAULT_BRANCH" -- 2>/dev/null || true
+                git push origin "$DEFAULT_BRANCH" --force
+              }
             ) 2>&1
 
             if [ $? -eq 0 ]; then
